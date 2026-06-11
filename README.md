@@ -1,5 +1,4 @@
 # radon-risk-oregon
-Hierarchical Bayesian ordinal regression on Oregon geologic data using JAX/blackjax
 Hierarchical Bayesian Radon Risk Modeling — Oregon
 Bayesian hierarchical ordinal regression model for radon potential in Oregon, fit using Hamiltonian Monte Carlo with the No-U-Turn Sampler (NUTS) implemented from scratch in JAX via blackjax.
 Overview
@@ -77,10 +76,16 @@ df = df.dropna(subset=["TERRANE_GR", "FIN_RN_RNK"])
 # Run model (see radon_model.py)
 
 python radon_model.py
+
 References
+
 Hoffman & Gelman (2014). The No-U-Turn Sampler. JMLR, 15, 1593–1623.
+
 Neal (2011). MCMC using Hamiltonian dynamics. Handbook of MCMC.
+
 Betancourt (2017). A conceptual introduction to HMC. arXiv:1701.02434.
+
 Gelman et al. (2013). Bayesian Data Analysis, 3rd ed.
+
 DOGAMI (2018). Radon potential of Oregon. Open-File Report O-18-01.
 
