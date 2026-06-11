@@ -1,0 +1,407 @@
+import numpy as np
+import pandas as pd
+import jax
+import jax.numpy as jnp
+import blackjax
+
+
+#  64-bit precision (slower but more stable)
+# jax.config.update("jax_enable_x64", True)
+
+LOG_2PI = jnp.log(2.0 * jnp.pi)
+
+# Import matplotlib for plots
+try:
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except ImportError:
+    print("matplotlib is not installed; skipping plots.")
+    HAVE_MPL = False
+
+
+# ---------- Basic logpdf helpers
+def normal_logpdf(x, loc, scale):
+    """Elementwise log N(loc, scale^2). Works with JAX arrays."""
+    z = (x - loc) / scale
+    return -0.5 * (z**2 + 2.0 * jnp.log(scale) + LOG_2PI)
+
+
+def ordered_loglik(y, eta, kappa1, kappa2):
+    """
+    Ordered logistic log-likelihood for y in {1,2,3}.
+
+    y     : (N,) int32, with values 1,2,3
+    eta   : (N,) real  (linear predictor)
+    kappa1, kappa2 : cutpoints, with kappa1 < kappa2
+    """
+    sigmoid = jax.nn.sigmoid
+
+    c1 = sigmoid(kappa1 - eta)
+    c2 = sigmoid(kappa2 - eta)
+
+    # category probabilities
+    p1 = jnp.clip(c1,       1e-12, 1.0 - 1e-12)
+    p2 = jnp.clip(c2 - c1,  1e-12, 1.0 - 1e-12)
+    p3 = jnp.clip(1.0 - c2, 1e-12, 1.0 - 1e-12)
+
+    logp1 = jnp.log(p1)
+    logp2 = jnp.log(p2)
+    logp3 = jnp.log(p3)
+
+    logp = jnp.where(y == 1, logp1,
+             jnp.where(y == 2, logp2, logp3))
+    return jnp.sum(logp)
+
+
+# ---------- Model parameter unpacking
+
+def unpack_theta_risk(theta, n_groups):
+    """
+    theta = [mu_alpha,
+             log_sigma_alpha,
+             kappa1_uncon,
+             kappa_delta,
+             alpha_raw[0], ..., alpha_raw[J-1]]
+    """
+    mu_alpha        = theta[0]
+    log_sigma_alpha = theta[1]
+    kappa1_uncon    = theta[2]
+    kappa_delta     = theta[3]
+    alpha_raw       = theta[4:]
+    assert alpha_raw.shape[0] == n_groups
+    return mu_alpha, log_sigma_alpha, kappa1_uncon, kappa_delta, alpha_raw
+
+
+def radon_risk_log_prob(theta, data):
+    """
+    Log joint density for hierarchical ordinal radon-risk model.
+
+    Data dict expects:
+      y          : (N,) int32, risk rank in {1,2,3}
+      terrane_idx: (N,) int32, 0..J-1 (group index)
+      n_groups   : int J
+    """
+    theta = jnp.asarray(theta)
+
+    y           = data["y"]            # (N,)
+    terrane_idx = data["terrane_idx"]  # (N,)
+    n_groups    = int(data["n_groups"])
+
+    (mu_alpha,
+     log_sigma_alpha,
+     kappa1_uncon,
+     kappa_delta,
+     alpha_raw) = unpack_theta_risk(theta, n_groups)
+
+    # Transformations
+    sigma_alpha = jnp.exp(log_sigma_alpha)
+    kappa1      = kappa1_uncon
+    kappa2      = kappa1_uncon + jnp.exp(kappa_delta)  # ensures kappa2 > kappa1
+
+    # Non-centered terrane intercepts
+    alpha = mu_alpha + sigma_alpha * alpha_raw  # (J,)
+
+    # Priors
+    lp = 0.0
+    lp += normal_logpdf(mu_alpha,        0.0, 5.0)   # global mean
+    lp += normal_logpdf(log_sigma_alpha, 0.0, 1.0)   # log SD
+    lp += normal_logpdf(kappa1_uncon,    0.0, 5.0)   # loose prior on first cutpoint
+    lp += normal_logpdf(kappa_delta,     0.0, 1.0)   # log gap between kappa1, kappa2
+    lp += jnp.sum(normal_logpdf(alpha_raw, 0.0, 1.0))  # non-centered effects
+
+    # Likelihood: ordered logit on risk rank
+    eta = alpha[terrane_idx]  # (N,)
+    lp += ordered_loglik(y, eta, kappa1, kappa2)
+
+    return lp
+
+
+def split_params_risk(samples, n_groups):
+    """
+    samples: (S, dim) array, dim = 4 + n_groups.
+
+    Returns a dict of named posterior draws.
+    """
+    samples = jnp.asarray(samples)
+
+    mu_alpha        = samples[:, 0]
+    log_sigma_alpha = samples[:, 1]
+    kappa1_uncon    = samples[:, 2]
+    kappa_delta     = samples[:, 3]
+    alpha_raw       = samples[:, 4:]
+
+    sigma_alpha = jnp.exp(log_sigma_alpha)
+    kappa1      = kappa1_uncon
+    kappa2      = kappa1_uncon + jnp.exp(kappa_delta)
+    alpha       = mu_alpha[:, None] + sigma_alpha[:, None] * alpha_raw
+
+    return dict(
+        mu_alpha=mu_alpha,
+        sigma_alpha=sigma_alpha,
+        kappa1=kappa1,
+        kappa2=kappa2,
+        alpha_raw=alpha_raw,
+        alpha=alpha,  # terrane intercepts
+    )
+
+
+# ---------- Posterior terrane-level risk probabilities 
+
+def terrane_risk_probs(alpha_s, kappa1_s, kappa2_s):
+    """
+    alpha_s : (S, J)
+    kappa1_s, kappa2_s : (S,)
+    Returns:
+      p1_s, p2_s, p3_s : (S, J) arrays of P(rank = 1,2,3) for each terrane.
+    """
+    S, J = alpha_s.shape
+    eta = alpha_s
+    k1 = kappa1_s[:, None]
+    k2 = kappa2_s[:, None]
+
+    sigmoid = jax.nn.sigmoid
+    c1 = sigmoid(k1 - eta)
+    c2 = sigmoid(k2 - eta)
+    p1 = c1
+    p2 = c2 - c1
+    p3 = 1.0 - c2
+    return p1, p2, p3
+
+
+# ---------- Plotting 
+
+def trace_and_hist(samples_1d, name):
+    """
+    Make a trace plot and marginal histogram for a 1D parameter.
+    """
+    if not HAVE_MPL:
+        return
+    arr = np.asarray(samples_1d)
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].plot(arr, linewidth=0.8)
+    axes[0].set_title(f"Trace of {name}")
+    axes[0].set_xlabel("Iteration")
+    axes[0].set_ylabel(name)
+
+    axes[1].hist(arr, bins=30, density=True)
+    axes[1].set_title(f"Posterior of {name}")
+    axes[1].set_xlabel(name)
+    axes[1].set_ylabel("Density")
+
+    fig.suptitle(f"BlackJAX NUTS samples for {name}", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(f"{name}_trace_hist.png", dpi=150)
+    plt.close(fig)
+
+
+def plot_terrane_alpha_intervals(alpha_s, outfile="terrane_alpha_intervals.png"):
+    """
+    alpha_s: (S, J) posterior draws of terrane intercepts.
+    """
+    if not HAVE_MPL:
+        return
+    alpha_np = np.asarray(alpha_s)
+    alpha_mean = alpha_np.mean(axis=0)
+    alpha_low  = np.percentile(alpha_np, 2.5, axis=0)
+    alpha_high = np.percentile(alpha_np, 97.5, axis=0)
+
+    J = alpha_np.shape[1]
+    x = np.arange(J)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.errorbar(
+        x,
+        alpha_mean,
+        yerr=[alpha_mean - alpha_low, alpha_high - alpha_mean],
+        fmt="o",
+        markersize=3,
+        capsize=2,
+    )
+    ax.set_xlabel("Terrane id")
+    ax.set_ylabel("Terrane intercept (alpha_j)")
+    ax.set_title("Posterior terrane intercepts (mean and 95% intervals)")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=150)
+    plt.close(fig)
+
+
+def plot_high_risk_hist(p3_mean, outfile="terrane_high_risk_prob_hist.png"):
+    """
+    p3_mean: (J,) array of posterior mean P(rank = 3) for each terrane.
+    """
+    if not HAVE_MPL:
+        return
+    arr = np.asarray(p3_mean)
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(arr, bins=20)
+    ax.set_xlabel("Posterior mean P(FIN_RN_RNK = 3)")
+    ax.set_ylabel("Number of terranes")
+    ax.set_title("Distribution of high radon risk probability across terranes")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=150)
+    plt.close(fig)
+
+
+# ---------- Main
+
+if __name__ == "__main__":
+
+    # 1. Load the radon risk / geology dataset from the same folder
+    csv_path = "Radon_Data_1136320385238331420.csv"
+    df = pd.read_csv(csv_path)
+
+    # Keep only rows with terrane and final radon rank defined
+    df = df.dropna(subset=["TERRANE_GR", "FIN_RN_RNK"]).reset_index(drop=True)
+
+    # 2. Build group index for terrane
+    df["terrane_cat"] = df["TERRANE_GR"].astype("category")
+    df["terrane_id"]  = df["terrane_cat"].cat.codes  # 0..J-1
+
+    # Response: risk rank in {1,2,3}
+    y = df["FIN_RN_RNK"].astype(int).values
+
+    print("FIN_RN_RNK value counts:")
+    print(df["FIN_RN_RNK"].value_counts().sort_index(), "\n")
+
+    terrane_idx = df["terrane_id"].values
+    n_groups    = df["terrane_id"].nunique()
+    N           = len(df)
+
+    print(f"N observations: {N}")
+    print(f"n_groups (terrane): {n_groups}")
+
+    # 3. Convert to JAX arrays
+    y_jax           = jnp.array(y, dtype=jnp.int32)
+    terrane_idx_jax = jnp.array(terrane_idx, dtype=jnp.int32)
+
+    data = dict(
+        y=y_jax,
+        terrane_idx=terrane_idx_jax,
+        n_groups=n_groups,
+    )
+
+    # 4. Define log-prob function and initial position
+    dim    = 4 + n_groups  # [mu_alpha, log_sigma_alpha, kappa1_uncon, kappa_delta, alpha_raw[0:J-1]]
+    theta0 = jnp.zeros(dim)
+
+    def logprob(theta):
+        # IMPORTANT: keep this returning a JAX scalar, no float() here
+        return radon_risk_log_prob(theta, data)
+
+    print("Initial log joint:", float(logprob(theta0)))
+
+    # 5. Run BlackJAX NUTS with window adaptation
+    num_warmup  = 1000
+    num_samples = 1000
+
+    key = jax.random.PRNGKey(0)
+
+    print(f"Starting BlackJAX NUTS: {num_warmup} warmup + {num_samples} samples")
+
+    # Window adaptation: this returns last_state and tuned parameters
+    key, warmup_key = jax.random.split(key)
+    adapt = blackjax.window_adaptation(blackjax.nuts, logprob)
+    (last_state, parameters), _ = adapt.run(warmup_key, theta0, num_warmup)
+
+    print("Adaptation finished.")
+
+    step_size = parameters["step_size"]
+    inv_mass  = parameters["inverse_mass_matrix"]
+
+    print("  step_size:", float(step_size))
+    print("  inverse_mass_matrix shape:", inv_mass.shape)
+
+    nuts   = blackjax.nuts(logprob, step_size=step_size, inverse_mass_matrix=inv_mass)
+    kernel = jax.jit(nuts.step)
+
+    # 6. Sampling loop
+    key, sample_key = jax.random.split(key)
+    keys = jax.random.split(sample_key, num_samples)
+
+    def one_step(state, key):
+        state, info = kernel(key, state)
+        return state, (state, info)
+
+    _, (states, infos) = jax.lax.scan(one_step, last_state, keys)
+
+    samples = states.position
+    accept_rate = float(jnp.mean(infos.acceptance_rate))
+
+    print("samples shape:", samples.shape)
+    print("mean acceptance rate:", accept_rate)
+
+    # 7. Posterior summaries
+    post = split_params_risk(samples, n_groups)
+
+    print("\nPosterior summaries (rough):")
+    for name in ["mu_alpha", "sigma_alpha", "kappa1", "kappa2"]:
+        arr_np = np.asarray(post[name])
+        print(f"{name:12s}  mean = {arr_np.mean(): .3f},  sd = {arr_np.std(): .3f}")
+
+    # Also report overall mean/sd of alpha (all terranes pooled)
+    alpha_np = np.asarray(post["alpha"])
+    print(f"{'alpha (all)':12s}  mean = {alpha_np.mean(): .3f},  sd = {alpha_np.std(): .3f}")
+
+    # 8. Save posterior draws (no nuts_posterior.npz used)
+    np.save("radon_risk_samples.npy", np.asarray(samples))
+    np.savez(
+        "radon_risk_posterior_summaries.npz",
+        mu_alpha=np.asarray(post["mu_alpha"]),
+        sigma_alpha=np.asarray(post["sigma_alpha"]),
+        kappa1=np.asarray(post["kappa1"]),
+        kappa2=np.asarray(post["kappa2"]),
+        alpha=np.asarray(post["alpha"]),
+    )
+    print("Saved posterior draws to radon_risk_samples.npy "
+          "and radon_risk_posterior_summaries.npz")
+
+    # 9. Terrane-level posterior risk probabilities
+    alpha_s  = post["alpha"]      # (S, J)
+    kappa1_s = post["kappa1"]     # (S,)
+    kappa2_s = post["kappa2"]     # (S,)
+
+    p1_s, p2_s, p3_s = terrane_risk_probs(alpha_s, kappa1_s, kappa2_s)
+
+    # Posterior means per terrane
+    p1_mean = np.asarray(p1_s.mean(axis=0))  # (J,)
+    p2_mean = np.asarray(p2_s.mean(axis=0))
+    p3_mean = np.asarray(p3_s.mean(axis=0))
+
+    # Attach to the terrane-level dataframe
+    terrane_levels = df[["terrane_cat", "terrane_id"]].drop_duplicates().sort_values("terrane_id")
+    terrane_levels["p_risk1"] = p1_mean
+    terrane_levels["p_risk2"] = p2_mean
+    terrane_levels["p_risk3"] = p3_mean
+
+    print("\nTerrane-level posterior mean risk probabilities (first 10 terranes):")
+    print(terrane_levels.head(10))
+
+    terrane_levels.to_csv("terrane_posterior_risk_probs.csv", index=False)
+    print("Saved terrane-level posterior probabilities to terrane_posterior_risk_probs.csv")
+
+    # 10. Plots to demonstrate NUTS performance and results
+    if HAVE_MPL:
+        print("\nCreating diagnostic and posterior plots...")
+
+        # Trace + hist for global parameters
+        trace_and_hist(post["mu_alpha"],    "mu_alpha")
+        trace_and_hist(post["sigma_alpha"], "sigma_alpha")
+        trace_and_hist(post["kappa1"],      "kappa1")
+        trace_and_hist(post["kappa2"],      "kappa2")
+
+        # Terrane intercept intervals
+        plot_terrane_alpha_intervals(alpha_s)
+
+        # Distribution of high-risk probability across terranes
+        plot_high_risk_hist(p3_mean)
+
+        print("Saved plots:")
+        print("  mu_alpha_trace_hist.png")
+        print("  sigma_alpha_trace_hist.png")
+        print("  kappa1_trace_hist.png")
+        print("  kappa2_trace_hist.png")
+        print("  terrane_alpha_intervals.png")
+        print("  terrane_high_risk_prob_hist.png")
+    else:
+        print("\nPlots skipped because matplotlib is not installed.")
