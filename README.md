@@ -65,17 +65,7 @@ pip install jax jaxlib blackjax pandas numpy matplotlib
 
 Data: download the DOGAMI radon potential polygon feature class from the Oregon Spatial Data Library.
 Usage
-# Load and preprocess data
 
-import pandas as pd
-
-df = pd.read_csv("radon_data.csv")
-
-df = df.dropna(subset=["TERRANE_GR", "FIN_RN_RNK"])
-
-# Run model (see radon_model.py)
-
-python radon_model.py
 
 References
 
